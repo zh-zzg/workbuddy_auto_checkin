@@ -514,13 +514,17 @@ def main():
     result_file = os.environ.get("WB_RESULT_FILE")
     if result_file:
         try:
-            push_line = ("✅ 已推送到%s" % push_channel if push_ok
-                         else "❌ 推送失败：%s" % push_reason)
+            if push_ok is None:
+                push_line = "已关闭（不推送）"
+            elif push_ok:
+                push_line = "✅ 已推送到%s" % push_channel
+            else:
+                push_line = "❌ 推送失败：%s" % push_reason
             with open(result_file, "w", encoding="utf-8") as f:
                 f.write("| 项目 | 结论 |\n| --- | --- |\n")
                 f.write("| 签到 | %s |\n" % checkin_line)
                 f.write("| 猫猫旅行 | %s |\n" % buddy_line)
-                f.write("| 飞书推送 | %s |\n" % push_line)
+                f.write("| 通知推送 | %s |\n" % push_line)
                 f.write("| 整体 | %s |\n" % ("成功（签到已达成）" if overall_ok else "失败（签到未达成）"))
         except OSError as e:
             log("结果文件写入失败：%s" % e)
