@@ -13,11 +13,16 @@
 
 import json
 import os
+import smtplib
 import ssl
 import sys
 import time
 import urllib.error
 import urllib.request
+from email.header import Header
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr, formatdate
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
 REQUEST_TIMEOUT = 20
@@ -357,6 +362,88 @@ def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
             return False, "重试 %d 次后仍异常：%s: %s" % (MAX_RETRY, type(e).__name__, e)
 
 
+# ---------------------------------------------------------------- 邮件（QQ 邮箱 SMTP）
+
+def push_email(cfg, title, checkin_line, buddy_line, overall_ok):
+    """把结果发到邮箱（默认 QQ 邮箱 SMTP）。返回 (ok, reason)。
+
+    cfg 为 dict：user / password / to / host / port。
+    QQ 邮箱必须在「设置 → 账号」里开启 SMTP 服务并生成「授权码」，
+    用授权码当密码，不能用登录密码。
+    """
+    user = cfg["user"]
+    to = cfg.get("to") or user
+    host = cfg.get("host") or "smtp.qq.com"
+    port = int(cfg.get("port") or 465)
+
+    subject = "【Buddy加油站】%s · %s" % ("成功" if overall_ok else "部分失败",
+                                        time.strftime("%Y-%m-%d"))
+    text = "\n".join([
+        title,
+        "",
+        "签到：%s" % checkin_line.replace("✅ ", "").replace("❌ ", ""),
+        "猫猫旅行：%s" % buddy_line.replace("🐱 ", ""),
+        "",
+        "—— 来自 WorkBuddy 每日自动化（GitHub Actions）",
+    ])
+    color = "#16a34a" if overall_ok else "#dc2626"
+    html = """<div style="font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+max-width:560px;margin:0 auto;padding:20px;border:1px solid #e5e7eb;border-radius:12px">
+<div style="font-size:17px;font-weight:600;color:%s;margin-bottom:4px">%s</div>
+<div style="font-size:12px;color:#9ca3af;margin-bottom:16px">%s</div>
+<div style="font-size:14px;color:#374151;line-height:1.8">
+<div style="font-weight:600;color:#111827">签到</div>
+<div>%s</div>
+<div style="font-weight:600;color:#111827;margin-top:14px">猫猫旅行</div>
+<div>%s</div>
+</div>
+<div style="margin-top:18px;padding-top:12px;border-top:1px dashed #e5e7eb;
+font-size:12px;color:#9ca3af">GitHub Actions · %s</div>
+</div>""" % (color, Header(subject, "utf-8").encode(),
+             time.strftime("%Y-%m-%d %H:%M", time.localtime()),
+             checkin_line, buddy_line, time.strftime("%Y-%m-%d %H:%M"))
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = formataddr((str(Header("Buddy加油站", "utf-8")), user))
+    msg["To"] = to
+    msg["Date"] = formatdate(localtime=True)
+    msg.attach(MIMEText(text, "plain", "utf-8"))
+    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            ctx = ssl.create_default_context()
+            if port == 465:
+                server = smtplib.SMTP_SSL(host, port, timeout=25, context=ctx)
+            else:
+                server = smtplib.SMTP(host, port, timeout=25)
+                server.starttls(context=ctx)
+            try:
+                server.login(user, cfg["password"])
+                server.sendmail(user, [to], msg.as_string())
+            finally:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+            log("  [邮件] 已发送 → %s" % masked(to))
+            return True, ""
+        except smtplib.SMTPAuthenticationError as e:
+            return False, ("邮箱登录被拒（%s）。QQ 邮箱要用「授权码」而不是登录密码，"
+                           "并确认已在设置里开启 SMTP 服务：检查 Secret QQ_MAIL_PASS"
+                           % getattr(e, "smtp_code", "535"))
+        except Exception as e:
+            if attempt < MAX_RETRY:
+                log("  [邮件] 发送异常，退避后重试（%d/%d）：%s: %s"
+                    % (attempt, MAX_RETRY, type(e).__name__, e))
+                time.sleep(2.0 * attempt)
+                continue
+            return False, "重试 %d 次后仍失败：%s: %s" % (MAX_RETRY, type(e).__name__, e)
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main():
@@ -364,11 +451,23 @@ def main():
     webhook = os.environ.get("FEISHU_WEBHOOK")
     endpoint = os.environ.get("WB_ENDPOINT") or DEFAULT_ENDPOINT
 
+    mail_cfg = None
+    mail_user = os.environ.get("QQ_MAIL_USER")
+    mail_pass = os.environ.get("QQ_MAIL_PASS")
+    if mail_user and mail_pass:
+        mail_cfg = {
+            "user": mail_user,
+            "password": mail_pass,
+            "to": os.environ.get("QQ_MAIL_TO") or mail_user,
+            "host": os.environ.get("QQ_MAIL_HOST") or "smtp.qq.com",
+            "port": os.environ.get("QQ_MAIL_PORT") or 465,
+        }
+
     if not token:
         log("缺少环境变量 WB_ACCESS_TOKEN（请在本机运行 refresh_token.py 注入 GitHub Secret）")
         return 2
-    if not webhook:
-        log("缺少环境变量 FEISHU_WEBHOOK")
+    if not mail_cfg and not webhook:
+        log("缺少通知渠道：未配置 QQ_MAIL_USER/QQ_MAIL_PASS，也未配置 FEISHU_WEBHOOK")
 
     headers = {
         "Accept": "application/json",
@@ -395,8 +494,12 @@ def main():
     buddy_line = ("🐱 " + buddy.get("report", "")) if buddy.get("report") else "🐱 无结论"
 
     # 推送状态与业务结论分开呈现：失败原因可诊断，但不污染签到结论
-    push_ok, push_reason = None, "未配置（缺少 FEISHU_WEBHOOK，本次不推送）"
-    if webhook:
+    push_ok, push_reason = None, "未配置通知渠道，本次不推送"
+    push_channel = "邮件"
+    if mail_cfg:
+        push_ok, push_reason = push_email(mail_cfg, "每日自动化", checkin_line, buddy_line, overall_ok)
+    elif webhook:
+        push_channel = "飞书"
         push_ok, push_reason = push_feishu(webhook, "每日自动化", checkin_line, buddy_line, overall_ok)
 
     result = {
@@ -411,7 +514,7 @@ def main():
     result_file = os.environ.get("WB_RESULT_FILE")
     if result_file:
         try:
-            push_line = ("✅ 已推送到飞书" if push_ok
+            push_line = ("✅ 已推送到%s" % push_channel if push_ok
                          else "❌ 推送失败：%s" % push_reason)
             with open(result_file, "w", encoding="utf-8") as f:
                 f.write("| 项目 | 结论 |\n| --- | --- |\n")
